@@ -232,7 +232,7 @@ def booking_link(answers, contact_username):
     result = diagnose(answers)
     copy = CONTENT["results"][result.key]
     title = copy["unknown_title"] if result.key == "check" and result.limited_data else copy["title"]
-    draft = f"Дима, привет! Прошёл тест «Где ты теряешь клиентов?».\n\nМой результат: {title.lower()}.\n\nХочу записаться на разбор."
+    draft = "Привет, Дима! Хочу на разбор!"
     return f"https://t.me/{contact_username}?" + urllib.parse.urlencode({"text": draft})
 
 
