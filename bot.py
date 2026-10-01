@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 import signal
 import sqlite3
+import struct
+import zlib
 import sys
 import time
 import urllib.error
@@ -21,6 +23,159 @@ from diagnosis import diagnose
 ROOT = Path(__file__).resolve().parent
 CONTENT = json.loads((ROOT / "content.json").read_text(encoding="utf-8"))
 LOG = logging.getLogger("svyazka")
+ANSWER_MARKS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
+BLUE = (31, 96, 205)
+DARK = (24, 53, 92)
+LIGHT = (238, 246, 255)
+GRID = (222, 235, 250)
+WHITE = (255, 255, 255)
+
+
+def _fill_rect(buf, w, h, x0, y0, x1, y1, color):
+    x0, x1 = max(0, x0), min(w, x1)
+    y0, y1 = max(0, y0), min(h, y1)
+    row = bytes(color) * max(0, x1 - x0)
+    for y in range(y0, y1):
+        off = (y * w + x0) * 3
+        buf[off:off + len(row)] = row
+
+
+def _pixel(buf, w, h, x, y, color):
+    if 0 <= x < w and 0 <= y < h:
+        off = (y * w + x) * 3
+        buf[off:off + 3] = bytes(color)
+
+
+def _line(buf, w, h, x0, y0, x1, y1, color, width=2):
+    dx, sx = abs(x1 - x0), 1 if x0 < x1 else -1
+    dy, sy = -abs(y1 - y0), 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        r = max(0, width // 2)
+        _fill_rect(buf, w, h, x0-r, y0-r, x0+r+1, y0+r+1, color)
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def _rect(buf, w, h, x, y, rw, rh, color, width=2, fill=None):
+    if fill:
+        _fill_rect(buf, w, h, x, y, x+rw, y+rh, fill)
+    _line(buf, w, h, x, y, x+rw, y, color, width)
+    _line(buf, w, h, x+rw, y, x+rw, y+rh, color, width)
+    _line(buf, w, h, x+rw, y+rh, x, y+rh, color, width)
+    _line(buf, w, h, x, y+rh, x, y, color, width)
+
+
+def _circle(buf, w, h, cx, cy, r, color, width=2, fill=None):
+    if fill:
+        for yy in range(-r, r+1):
+            xx = int((max(0, r*r - yy*yy)) ** 0.5)
+            _line(buf, w, h, cx-xx, cy+yy, cx+xx, cy+yy, fill, 1)
+    x, y, d = r, 0, 1-r
+    while x >= y:
+        pts = ((x,y),(y,x),(-y,x),(-x,y),(-x,-y),(-y,-x),(y,-x),(x,-y))
+        for px, py in pts:
+            rr = max(0, width // 2)
+            _fill_rect(buf, w, h, cx+px-rr, cy+py-rr, cx+px+rr+1, cy+py+rr+1, color)
+        y += 1
+        if d <= 0:
+            d += 2*y + 1
+        else:
+            x -= 1
+            d += 2*(y-x) + 1
+
+
+def _icon(buf, w, h, x, y, kind):
+    # Compact schematic icons: post, people, megaphone, chat, chart, pause.
+    if kind == 0:
+        _rect(buf, w, h, x, y, 62, 46, BLUE, 2, WHITE)
+        _circle(buf, w, h, x+12, y+11, 5, BLUE, 2, LIGHT)
+        _line(buf, w, h, x+22, y+10, x+50, y+10, DARK, 2)
+        _line(buf, w, h, x+10, y+24, x+50, y+24, GRID, 3)
+        _line(buf, w, h, x+10, y+34, x+42, y+34, GRID, 3)
+    elif kind == 1:
+        for dx in (8, 31, 54):
+            _circle(buf, w, h, x+dx, y+15, 7, BLUE, 2, LIGHT)
+            _circle(buf, w, h, x+dx, y+38, 12, BLUE, 2, LIGHT)
+    elif kind == 2:
+        _line(buf, w, h, x+8, y+26, x+43, y+12, BLUE, 3)
+        _line(buf, w, h, x+8, y+26, x+43, y+40, BLUE, 3)
+        _line(buf, w, h, x+43, y+12, x+43, y+40, BLUE, 3)
+        _rect(buf, w, h, x+5, y+22, 10, 10, DARK, 2, LIGHT)
+        _line(buf, w, h, x+50, y+18, x+62, y+12, BLUE, 2)
+        _line(buf, w, h, x+50, y+34, x+62, y+40, BLUE, 2)
+    elif kind == 3:
+        _rect(buf, w, h, x+3, y+4, 54, 30, BLUE, 2, WHITE)
+        _rect(buf, w, h, x+18, y+24, 48, 28, DARK, 2, LIGHT)
+        for dx in (28, 39, 50):
+            _circle(buf, w, h, x+dx, y+38, 2, BLUE, 1, BLUE)
+    elif kind == 4:
+        _line(buf, w, h, x+8, y+47, x+8, y+8, DARK, 2)
+        _line(buf, w, h, x+8, y+47, x+65, y+47, DARK, 2)
+        for i, bh in enumerate((18, 31, 24)):
+            _rect(buf, w, h, x+18+i*15, y+47-bh, 9, bh, BLUE, 2, LIGHT)
+    else:
+        _circle(buf, w, h, x+34, y+27, 24, BLUE, 2, LIGHT)
+        _rect(buf, w, h, x+24, y+14, 6, 26, DARK, 1, DARK)
+        _rect(buf, w, h, x+38, y+14, 6, 26, DARK, 1, DARK)
+
+
+def question_image_bytes(index):
+    w, h = 720, 480
+    buf = bytearray(WHITE * (w * h))
+    for x in range(0, w, 32):
+        _line(buf, w, h, x, 0, x, h-1, GRID, 1)
+    for y in range(0, h, 32):
+        _line(buf, w, h, 0, y, w-1, y, GRID, 1)
+    _rect(buf, w, h, 18, 18, w-36, h-36, BLUE, 2)
+    count = len(CONTENT["questions"][index]["answers"])
+    if count == 5:
+        panels = [(50,58),(520,58),(50,305),(285,330),(520,305)]
+    else:
+        panels = [(65,70),(505,70),(65,300),(505,300)]
+    cx, cy = 360, 230
+    _circle(buf, w, h, cx, cy, 61, BLUE, 3, LIGHT)
+    _circle(buf, w, h, cx, cy, 43, GRID, 2, WHITE)
+    _circle(buf, w, h, cx, cy-9, 14, BLUE, 2, LIGHT)
+    _circle(buf, w, h, cx, cy+26, 26, BLUE, 2, LIGHT)
+    # A small blueprint accent changes with the question block.
+    if index < 3:
+        _line(buf, w, h, cx-30, cy+48, cx+30, cy+48, DARK, 3)
+    elif index < 6:
+        _rect(buf, w, h, cx-27, cy-18, 54, 38, DARK, 2, WHITE)
+    else:
+        _rect(buf, w, h, cx-28, cy-15, 56, 30, BLUE, 2, WHITE)
+    for j, (px, py) in enumerate(panels):
+        pw, ph = 150, 92
+        pcx, pcy = px + pw//2, py + ph//2
+        _line(buf, w, h, pcx, pcy, cx, cy, BLUE, 2)
+        _circle(buf, w, h, (pcx+cx)//2, (pcy+cy)//2, 3, BLUE, 1, BLUE)
+        _rect(buf, w, h, px, py, pw, ph, BLUE, 2, LIGHT)
+        _icon(buf, w, h, px+43, py+18, (index*2 + j) % 6)
+        # tiny option marker, deliberately visual rather than textual
+        _circle(buf, w, h, px+16, py+16, 7, DARK, 2, WHITE)
+    # Technical corner marks.
+    for x, y, sx, sy in ((28,28,1,1),(w-28,28,-1,1),(28,h-28,1,-1),(w-28,h-28,-1,-1)):
+        _line(buf,w,h,x,y,x+18*sx,y,BLUE,2)
+        _line(buf,w,h,x,y,x,y+18*sy,BLUE,2)
+
+    stride = w * 3
+    raw = b"".join(b"\x00" + bytes(buf[y*stride:(y+1)*stride]) for y in range(h))
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
 
 
 def load_env(path):
@@ -99,8 +254,8 @@ def screen(session, contact_username):
     parts.append(f"<b>{html.escape(q['text'])}</b>")
     if i != 3 and q.get("note"):
         parts.append(html.escape(q["note"]))
-    parts.append("\n\n".join(f"{j + 1}. {html.escape(answer)}" for j, answer in enumerate(q["answers"])))
-    buttons = [[{"text": str(j + 1), "callback_data": f"a:{prefix}:{i}:{j}"} for j in range(len(q["answers"]))]]
+    parts.append("\n\n".join(f"{ANSWER_MARKS[j]} {html.escape(answer)}" for j, answer in enumerate(q["answers"])))
+    buttons = [[{"text": ANSWER_MARKS[j], "callback_data": f"a:{prefix}:{i}:{j}"} for j in range(len(q["answers"]))]]
     if i:
         buttons.append([{"text": "← Назад", "callback_data": f"back:{prefix}"}])
     return "\n\n".join(parts), {"inline_keyboard": buttons}
@@ -157,10 +312,24 @@ class QuizBot:
                            session["sid"] if session else None,
                            session["revision"] if session else None)
 
+    def photo(self, uid, text, markup, question_index, session):
+        payload = {
+            "chat_id": uid,
+            "caption": text,
+            "parse_mode": "HTML",
+            "reply_markup": markup,
+            "_question_index": question_index,
+        }
+        self.store.enqueue("sendPhotoGenerated", payload, uid, session["sid"], session["revision"])
+
     def render(self, uid):
         session = self.store.get(uid)
         text, markup = screen(session, self.contact_username)
-        self.say(uid, text, markup, session)
+        answers = json.loads(session["answers"])
+        if session["screen"] == "quiz" and len(answers) < 9:
+            self.photo(uid, text, markup, len(answers), session)
+        else:
+            self.say(uid, text, markup, session)
 
     def retire(self, uid, session):
         self.store.db.execute("DELETE FROM outbox WHERE uid=? AND sid IS NOT NULL", (uid,))
@@ -273,9 +442,8 @@ class Telegram:
     def __init__(self, token):
         self._base = "https://api.telegram.org/bot" + token + "/"
 
-    def call(self, method, payload=None):
-        body = json.dumps(payload or {}).encode()
-        request = urllib.request.Request(self._base + method, data=body, headers={"Content-Type": "application/json"})
+    def _request(self, method, body, content_type):
+        request = urllib.request.Request(self._base + method, data=body, headers={"Content-Type": content_type})
         try:
             with urllib.request.urlopen(request, timeout=45) as response:
                 result = json.loads(response.read())
@@ -290,6 +458,32 @@ class Telegram:
             raise APIError(result.get("error_code", 0), result.get("description", ""), result.get("parameters", {}).get("retry_after", 0))
         return result["result"]
 
+    def call(self, method, payload=None):
+        body = json.dumps(payload or {}).encode()
+        return self._request(method, body, "application/json")
+
+    def call_file(self, method, payload, field, data, filename):
+        boundary = "----svyazka" + uuid.uuid4().hex
+        b = boundary.encode()
+        parts = []
+        for key, value in payload.items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False)
+            value = str(value).encode("utf-8")
+            parts.extend([
+                b"--" + b + b"\r\n",
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode(),
+                value, b"\r\n"
+            ])
+        parts.extend([
+            b"--" + b + b"\r\n",
+            f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'.encode(),
+            b"Content-Type: image/png\r\n\r\n",
+            data, b"\r\n",
+            b"--" + b + b"--\r\n"
+        ])
+        return self._request(method, b"".join(parts), f"multipart/form-data; boundary={boundary}")
+
 
 def drain(store, api):
     """Durable outgoing queue: saved answers survive an API outage or restart."""
@@ -298,8 +492,15 @@ def drain(store, api):
         if row is None:
             return
         method = row["method"]
+        payload = json.loads(row["payload"])
         try:
-            result = api.call(method, json.loads(row["payload"]))
+            if method == "sendPhotoGenerated":
+                question_index = int(payload.pop("_question_index"))
+                result = api.call_file("sendPhoto", payload, "photo",
+                                       question_image_bytes(question_index),
+                                       f"question-{question_index + 1}.png")
+            else:
+                result = api.call(method, payload)
         except APIError as exc:
             if exc.code in (400, 403) and (method != "sendMessage" or exc.code == 403):
                 with store.db:
@@ -308,7 +509,7 @@ def drain(store, api):
                 continue
             raise
         with store.db:
-            if method == "sendMessage" and row["sid"] is not None:
+            if method in ("sendMessage", "sendPhotoGenerated") and row["sid"] is not None:
                 store.db.execute("UPDATE sessions SET message_id=? WHERE uid=? AND sid=? AND revision=?",
                                  (result["message_id"], row["uid"], row["sid"], row["revision"]))
             store.db.execute("DELETE FROM outbox WHERE id=?", (row["id"],))
@@ -323,7 +524,7 @@ def demo():
         q = CONTENT["questions"][i]
         print(f"\n{i + 1}/9. {q['text']}")
         for j, answer in enumerate(q["answers"], 1):
-            print(f"{j}. {answer}")
+            print(f"{ANSWER_MARKS[j - 1]} {answer}")
         choice = input("Ответ (цифра; b — назад): ").strip()
         if choice == "b" and answers:
             answers.pop()
