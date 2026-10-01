@@ -243,8 +243,7 @@ def screen(session, contact_username):
         return CONTENT["intro"], {"inline_keyboard": [[{"text": "НАЧАТЬ ТЕСТ", "callback_data": f"start:{prefix}"}]]}
     if len(answers) == 9:
         return result_text(answers), {"inline_keyboard": [
-            [{"text": "НАПИСАТЬ ДИМЕ", "url": booking_link(answers, contact_username)}],
-            [{"text": "Пройти заново", "callback_data": f"restart:{prefix}"}]
+            [{"text": "НАПИСАТЬ ДИМЕ", "url": booking_link(answers, contact_username)}]
         ]}
     i = len(answers)
     q = CONTENT["questions"][i]
