@@ -342,28 +342,58 @@ class QuizBot:
         if username and username == self.contact_username.lower():
             self.store.set_meta("admin_uid", user.get("id"))
 
+    def completion_payload(self, user, answers):
+        result = diagnose(answers)
+        copy = CONTENT["results"][result.key]
+        title = copy["unknown_title"] if result.key == "check" and result.limited_data else copy["title"]
+        username = user.get("username") or ""
+        name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x).strip()
+        return {
+            "completed_at": int(time.time()),
+            "telegram_id": user.get("id"),
+            "username": username,
+            "name": name,
+            "result": title,
+            "answers": [CONTENT["questions"][i]["answers"][choice] for i, choice in enumerate(answers)],
+        }
+
     def notify_admin(self, user, answers):
         admin_uid = self.store.get_meta("admin_uid")
         if not admin_uid:
             return
-        result = diagnose(answers)
-        copy = CONTENT["results"][result.key]
-        title = copy["unknown_title"] if result.key == "check" and result.limited_data else copy["title"]
-        username = user.get("username")
-        name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x).strip() or "Без имени"
+        data = self.completion_payload(user, answers)
+        username = data["username"]
         lines = [
             "<b>НОВОЕ ПРОХОЖДЕНИЕ ТЕСТА</b>",
-            f"Пользователь: {html.escape(name)}",
+            f"Пользователь: {html.escape(data['name'] or 'Без имени')}",
             f"Telegram: {'@' + html.escape(username) if username else 'нет username'}",
-            f"ID: <code>{user.get('id')}</code>",
-            f"Результат: <b>{html.escape(title)}</b>",
+            f"ID: <code>{data['telegram_id']}</code>",
+            f"Результат: <b>{html.escape(data['result'])}</b>",
             "",
             "<b>Ответы:</b>"
         ]
-        for i, choice in enumerate(answers):
-            q = CONTENT["questions"][i]
-            lines.append(f"{i + 1}. {html.escape(q['answers'][choice])}")
+        for i, answer in enumerate(data["answers"], 1):
+            lines.append(f"{i}. {html.escape(answer)}")
         self.say(admin_uid, "\n".join(lines))
+
+    def send_to_sheets(self, user, answers):
+        url = os.getenv("SHEETS_WEBHOOK_URL", "").strip()
+        if not url:
+            return
+        data = self.completion_payload(user, answers)
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                if not 200 <= response.status < 300:
+                    LOG.warning("Google Sheets webhook вернул HTTP %s", response.status)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+            LOG.warning("Не удалось записать результат в Google Sheets: %s", type(exc).__name__)
 
     def retire(self, uid, session):
         self.store.db.execute("DELETE FROM outbox WHERE uid=? AND sid IS NOT NULL", (uid,))
@@ -467,6 +497,7 @@ class QuizBot:
         self.store.save(uid, session["sid"], answers, view, session["revision"] + 1)
         if view == "result" and len(answers) == 9:
             self.notify_admin(user, answers)
+            self.send_to_sheets(user, answers)
         self.render(uid)
 
 
