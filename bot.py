@@ -304,6 +304,16 @@ class Store:
     def set_meta(self, key, value):
         self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, int(value)))
 
+    def stats(self):
+        total = self.db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        started = self.db.execute(
+            "SELECT COUNT(*) FROM sessions WHERE json_array_length(answers) > 0"
+        ).fetchone()[0]
+        completed = self.db.execute(
+            "SELECT COUNT(*) FROM sessions WHERE json_array_length(answers) = 9"
+        ).fetchone()[0]
+        return total, started, completed
+
 
 class QuizBot:
     def __init__(self, store, contact_username):
@@ -426,7 +436,21 @@ class QuizBot:
         text = message.get("text", "").strip()
         command = text.split()[0].split("@")[0].lower() if text else ""
         session = self.store.get(uid)
-        if command == "/delete":
+        if command == "/stats":
+            if (user.get("username") or "").lower() != self.contact_username.lower():
+                self.say(uid, "Команда недоступна.")
+                return
+            total, started, completed = self.store.stats()
+            conversion = (completed / total * 100) if total else 0
+            self.say(
+                uid,
+                "<b>СТАТИСТИКА БОТА</b>\n\n"
+                f"Запустили: <b>{total}</b>\n"
+                f"Начали тест: <b>{started}</b>\n"
+                f"Завершили: <b>{completed}</b>\n"
+                f"Конверсия запуск → завершение: <b>{conversion:.1f}%</b>"
+            )
+        elif command == "/delete":
             self.retire(uid, session)
             self.store.db.execute("DELETE FROM sessions WHERE uid=?", (uid,))
             self.say(uid, "Твои ответы и результат удалены из базы бота. Сообщения в Telegram остаются в чате.\n\nЧтобы начать снова, нажми /start.")
@@ -632,6 +656,7 @@ def main():
             {"command": "start", "description": "Начать или продолжить тест"},
             {"command": "restart", "description": "Пройти тест заново"},
             {"command": "help", "description": "Как пройти тест"},
+            {"command": "stats", "description": "Статистика бота"},
             {"command": "delete", "description": "Удалить сохранённые ответы"}
         ]})
     except APIError as exc:
