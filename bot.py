@@ -297,6 +297,13 @@ class Store:
     def offset(self):
         return self.db.execute("SELECT value FROM meta WHERE key='offset'").fetchone()[0]
 
+    def get_meta(self, key, default=None):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_meta(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, int(value)))
+
 
 class QuizBot:
     def __init__(self, store, contact_username):
@@ -330,6 +337,34 @@ class QuizBot:
         else:
             self.say(uid, text, markup, session)
 
+    def maybe_register_admin(self, user):
+        username = (user.get("username") or "").lower()
+        if username and username == self.contact_username.lower():
+            self.store.set_meta("admin_uid", user.get("id"))
+
+    def notify_admin(self, user, answers):
+        admin_uid = self.store.get_meta("admin_uid")
+        if not admin_uid:
+            return
+        result = diagnose(answers)
+        copy = CONTENT["results"][result.key]
+        title = copy["unknown_title"] if result.key == "check" and result.limited_data else copy["title"]
+        username = user.get("username")
+        name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x).strip() or "Без имени"
+        lines = [
+            "<b>НОВОЕ ПРОХОЖДЕНИЕ ТЕСТА</b>",
+            f"Пользователь: {html.escape(name)}",
+            f"Telegram: {'@' + html.escape(username) if username else 'нет username'}",
+            f"ID: <code>{user.get('id')}</code>",
+            f"Результат: <b>{html.escape(title)}</b>",
+            "",
+            "<b>Ответы:</b>"
+        ]
+        for i, choice in enumerate(answers):
+            q = CONTENT["questions"][i]
+            lines.append(f"{i + 1}. {html.escape(q['answers'][choice])}")
+        self.say(admin_uid, "\n".join(lines))
+
     def retire(self, uid, session):
         self.store.db.execute("DELETE FROM outbox WHERE uid=? AND sid IS NOT NULL", (uid,))
         if session and session["message_id"]:
@@ -357,6 +392,7 @@ class QuizBot:
         if chat.get("type") != "private" or user.get("is_bot") or chat.get("id") != user.get("id"):
             return
         uid = chat["id"]
+        self.maybe_register_admin(user)
         text = message.get("text", "").strip()
         command = text.split()[0].split("@")[0].lower() if text else ""
         session = self.store.get(uid)
@@ -385,6 +421,7 @@ class QuizBot:
         chat = message.get("chat", {})
         user = callback.get("from", {})
         uid = user.get("id")
+        self.maybe_register_admin(user)
         def ack(text=""):
             payload = {"callback_query_id": callback_id}
             if text:
@@ -428,6 +465,8 @@ class QuizBot:
         ack()
         self.retire(uid, session)
         self.store.save(uid, session["sid"], answers, view, session["revision"] + 1)
+        if view == "result" and len(answers) == 9:
+            self.notify_admin(user, answers)
         self.render(uid)
 
 
